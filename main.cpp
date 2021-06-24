@@ -101,18 +101,20 @@ void on_sigint(int)
 
     if (s_chance_to_drop_clientbound > 0.0 && s_total_clientbound_packets != 0)
     {
-        outln("Total Clientbound Dropped Packets: {} ({:.2}% of total packets)",
-              s_total_clientbound_dropped_packets,
+        outln("Total Clientbound Dropped Packets: {} ({:.2}% of total packets)", s_total_clientbound_dropped_packets,
               ((double) s_total_clientbound_dropped_packets / (double) s_total_clientbound_packets) * 100);
-        outln("Total Clientbound Dropped Bytes: {} ({:.2}% of total bytes)", s_total_clientbound_dropped_bytes,
+        outln("Total Clientbound Dropped Bytes: {} ({:.2}% of total bytes)",
+              AK::human_readable_size_long(s_total_clientbound_dropped_bytes),
               ((double) s_total_clientbound_dropped_bytes / (double) s_total_clientbound_bytes) * 100);
     }
 
     if (s_chance_to_drop_serverbound > 0.0 && s_total_serverbound_packets != 0)
     {
-        outln("Total Serverbound Dropped Packets: {} ({:.2}% of total packets)", s_total_serverbound_dropped_packets,
+        outln("Total Serverbound Dropped Packets: {} ({:.2}% of total packets)",
+              s_total_serverbound_dropped_packets,
               ((double) s_total_serverbound_dropped_packets / (double) s_total_serverbound_packets) * 100);
-        outln("Total Serverbound Dropped Bytes: {} ({:.2}% of total bytes)", s_total_serverbound_dropped_bytes,
+        outln("Total Serverbound Dropped Bytes: {} ({:.2}% of total bytes)",
+              AK::human_readable_size_long(s_total_serverbound_dropped_bytes),
               ((double) s_total_serverbound_dropped_bytes / (double) s_total_serverbound_bytes) * 100);
     }
 
