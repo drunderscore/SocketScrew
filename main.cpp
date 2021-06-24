@@ -20,9 +20,15 @@ static double s_chance_to_drop_clientbound = 0.0;
 static double s_chance_to_drop_serverbound = 0.0;
 static double s_chance_to_modify_clientbound = 0.0;
 static double s_chance_to_modify_serverbound = 0.0;
+static double s_chance_to_duplicate_packet_clientbound = 0.0;
+static double s_chance_to_duplicate_packet_serverbound = 0.0;
+static bool s_fake_clientbound_jitter = false;
+static bool s_fake_serverbound_jitter = false;
 static bool s_small_modification = false;
 // TODO: This vector is never emptied
 static Vector<AK::NonnullRefPtr<Core::Timer>, 256> m_latent_packets;
+static Vector<int, 1024> s_clientbound_latency_history;
+static Vector<int, 1024> s_serverbound_latency_history;
 static Optional<sockaddr_in> who = {};
 static constexpr int who_len = sizeof(sockaddr_in);
 
@@ -37,6 +43,8 @@ static u64 s_total_clientbound_dropped_bytes = 0;
 static u64 s_total_serverbound_dropped_bytes = 0;
 static u64 s_total_clientbound_modified_packets = 0;
 static u64 s_total_serverbound_modified_packets = 0;
+static u64 s_total_clientbound_duplicated_packets = 0;
+static u64 s_total_serverbound_duplicated_packets = 0;
 
 void send_to_client(NonnullRefPtr<Core::UDPSocket> the, NonnullRefPtr<Core::UDPServer> our, ByteBuffer bytes)
 {
@@ -48,7 +56,10 @@ void forward_to_client(NonnullRefPtr<Core::UDPSocket> the, NonnullRefPtr<Core::U
 {
     if (s_fake_clientbound_latency > 0)
     {
-        auto timer = Core::Timer::create_single_shot(s_fake_clientbound_latency, [=, bytes = move(bytes)]() mutable
+        auto delay = s_fake_clientbound_jitter ? AK::get_random_uniform(s_fake_clientbound_latency)
+                                               : s_fake_clientbound_latency;
+        s_clientbound_latency_history.append(delay);
+        auto timer = Core::Timer::create_single_shot(delay, [=, bytes = move(bytes)]() mutable
         {
             send_to_client(the, our, move(bytes));
         });
@@ -70,7 +81,10 @@ void forward_to_server(NonnullRefPtr<Core::UDPSocket> the, NonnullRefPtr<Core::U
 {
     if (s_fake_serverbound_latency > 0)
     {
-        auto timer = Core::Timer::create_single_shot(s_fake_serverbound_latency, [=, bytes = move(bytes)]() mutable
+        auto delay = s_fake_serverbound_jitter ? AK::get_random_uniform(s_fake_serverbound_latency)
+                                               : s_fake_serverbound_latency;
+        s_serverbound_latency_history.append(delay);
+        auto timer = Core::Timer::create_single_shot(delay, [=, bytes = move(bytes)]() mutable
         {
             send_to_server(the, our, move(bytes));
         });
@@ -88,10 +102,34 @@ void on_sigint(int)
     outln();
 
     if (s_fake_clientbound_latency > 0)
-        outln("Fake Clientbound Latency: {}ms", s_fake_clientbound_latency);
+    {
+        outln("Fake Clientbound Latency: {}ms, jitter: {}", s_fake_clientbound_latency, s_fake_clientbound_jitter);
+        auto latency_size = s_clientbound_latency_history.size();
+
+        if (latency_size > 0)
+        {
+            u64 total_latency = 0;
+            for (auto& val : s_clientbound_latency_history)
+                total_latency += val;
+            outln("Average Clientbound Latency: {:.2}ms",
+                  (double) total_latency / (double) latency_size);
+        }
+    }
 
     if (s_fake_serverbound_latency > 0)
-        outln("Fake Serverbound Latency: {}ms", s_fake_serverbound_latency);
+    {
+        outln("Fake Serverbound Latency: {}ms, jitter: {}", s_fake_serverbound_latency, s_fake_serverbound_jitter);
+        auto latency_size = s_serverbound_latency_history.size();
+
+        if (latency_size > 0)
+        {
+            u64 total_latency = 0;
+            for (auto& val : s_serverbound_latency_history)
+                total_latency += val;
+            outln("Average Serverbound Latency: {:.2}ms",
+                  (double) total_latency / (double) latency_size);
+        }
+    }
 
     outln("Total Clientbound Packets: {}", s_total_clientbound_packets);
     outln("Total Serverbound Packets: {}", s_total_serverbound_packets);
@@ -128,6 +166,20 @@ void on_sigint(int)
     {
         outln("Total Serverbound Modified Packets: {} ({:.2}% of total packets)", s_total_serverbound_modified_packets,
               ((double) s_total_serverbound_modified_packets / (double) s_total_serverbound_packets) * 100);
+    }
+
+    if (s_chance_to_duplicate_packet_clientbound > 0.0 && s_total_clientbound_packets != 0)
+    {
+        outln("Total Clientbound Duplicated Packets: {} ({:.2}% of total packets)",
+              s_total_clientbound_duplicated_packets,
+              ((double) s_total_clientbound_duplicated_packets / (double) s_total_clientbound_packets) * 100);
+    }
+
+    if (s_chance_to_duplicate_packet_serverbound > 0.0 && s_total_serverbound_packets != 0)
+    {
+        outln("Total Serverbound Duplicated Packets: {} ({:.2}% of total packets)",
+              s_total_serverbound_duplicated_packets,
+              ((double) s_total_serverbound_duplicated_packets / (double) s_total_serverbound_packets) * 100);
     }
 
     exit(0);
@@ -168,6 +220,18 @@ int main(int argc, char** argv)
     args_parser.add_option(s_small_modification,
                            "Only increment or decrement that single byte",
                            "small", 's');
+    args_parser.add_option(s_fake_serverbound_jitter,
+                           "Makes the server-latency option random (from 0 to server-latency ms), simulating packet jitter.",
+                           "server-jitter", 'j');
+    args_parser.add_option(s_fake_clientbound_jitter,
+                           "Makes the client-latency option random (from 0 to client-latency ms), simulating packet jitter.",
+                           "client-jitter", 'J');
+    args_parser.add_option(s_chance_to_duplicate_packet_serverbound,
+                           "Chance to duplicate a serverbound packet.",
+                           "server-duplicate", 'u', "Chance");
+    args_parser.add_option(s_chance_to_duplicate_packet_clientbound,
+                           "Chance to duplicate a clientbound packet.",
+                           "client-duplicate", 'U', "Chance");
     args_parser.add_positional_argument(the_server_address_string, "Address of the server to forward", "The address");
     args_parser.add_positional_argument(the_server_port, "Port of the server to forward", "The port");
     args_parser.add_positional_argument(our_server_port,
@@ -209,6 +273,7 @@ int main(int argc, char** argv)
             s_total_clientbound_dropped_bytes += bytes.size();
             return;
         }
+
         if (s_chance_to_modify_clientbound > (double) (rand() / (double) RAND_MAX))
         {
             s_total_clientbound_modified_packets++;
@@ -220,7 +285,14 @@ int main(int argc, char** argv)
 
             dbgln_if(MODIFY_PACKET_DEBUG, "Modifying clientbound packet");
         }
+
         dbgln_if(FORWARD_SIZE_DEBUG, "{} bytes to client", bytes.size());
+        if (s_chance_to_duplicate_packet_clientbound > (double) (rand() / (double) RAND_MAX))
+        {
+            s_total_clientbound_duplicated_packets++;
+            auto bytes_copy = bytes;
+            forward_to_client(the_server, our_server, move(bytes_copy));
+        }
         forward_to_client(the_server, our_server, move(bytes));
     };
 
@@ -243,6 +315,7 @@ int main(int argc, char** argv)
             s_total_serverbound_dropped_bytes += bytes.size();
             return;
         }
+
         if (s_chance_to_modify_serverbound > (double) (rand() / (double) RAND_MAX))
         {
             s_total_serverbound_modified_packets++;
@@ -253,7 +326,14 @@ int main(int argc, char** argv)
                 bytes[random_index] = AK::get_random<u8>();
             dbgln_if(MODIFY_PACKET_DEBUG, "Modifying serverbound packet");
         }
+
         dbgln_if(FORWARD_SIZE_DEBUG, "{} bytes to server", bytes.size());
+        if (s_chance_to_duplicate_packet_serverbound > (double) (rand() / (double) RAND_MAX))
+        {
+            s_total_serverbound_duplicated_packets++;
+            auto bytes_copy = bytes;
+            forward_to_server(the_server, our_server, move(bytes_copy));
+        }
         forward_to_server(the_server, our_server, move(bytes));
     };
 
