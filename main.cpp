@@ -4,7 +4,9 @@
 #include <LibCore/ArgsParser.h>
 #include <LibCore/Timer.h>
 #include <time.h>
+#include <signal.h>
 #include <AK/Random.h>
+#include <AK/NumberFormat.h>
 
 #define FORWARD_SIZE_DEBUG 0
 #define DROP_PACKET_DEBUG 0
@@ -23,6 +25,18 @@ static bool s_small_modification = false;
 static Vector<AK::NonnullRefPtr<Core::Timer>, 256> m_latent_packets;
 static Optional<sockaddr_in> who = {};
 static constexpr int who_len = sizeof(sockaddr_in);
+
+// Statistics
+static u64 s_total_clientbound_packets = 0;
+static u64 s_total_serverbound_packets = 0;
+static u64 s_total_clientbound_bytes = 0;
+static u64 s_total_serverbound_bytes = 0;
+static u64 s_total_clientbound_dropped_packets = 0;
+static u64 s_total_serverbound_dropped_packets = 0;
+static u64 s_total_clientbound_dropped_bytes = 0;
+static u64 s_total_serverbound_dropped_bytes = 0;
+static u64 s_total_clientbound_modified_packets = 0;
+static u64 s_total_serverbound_modified_packets = 0;
 
 void send_to_client(NonnullRefPtr<Core::UDPSocket> the, NonnullRefPtr<Core::UDPServer> our, ByteBuffer bytes)
 {
@@ -69,18 +83,68 @@ void forward_to_server(NonnullRefPtr<Core::UDPSocket> the, NonnullRefPtr<Core::U
     }
 }
 
+void on_sigint(int)
+{
+    outln();
+
+    if (s_fake_clientbound_latency > 0)
+        outln("Fake Clientbound Latency: {}ms", s_fake_clientbound_latency);
+
+    if (s_fake_serverbound_latency > 0)
+        outln("Fake Serverbound Latency: {}ms", s_fake_serverbound_latency);
+
+    outln("Total Clientbound Packets: {}", s_total_clientbound_packets);
+    outln("Total Serverbound Packets: {}", s_total_serverbound_packets);
+
+    outln("Total Clientbound Bytes: {}", AK::human_readable_size_long(s_total_clientbound_bytes));
+    outln("Total Serverbound Bytes: {}", AK::human_readable_size_long(s_total_serverbound_bytes));
+
+    if (s_chance_to_drop_clientbound > 0.0 && s_total_clientbound_packets != 0)
+    {
+        outln("Total Clientbound Dropped Packets: {} ({:.2}% of total packets)",
+              s_total_clientbound_dropped_packets,
+              ((double) s_total_clientbound_dropped_packets / (double) s_total_clientbound_packets) * 100);
+        outln("Total Clientbound Dropped Bytes: {} ({:.2}% of total bytes)", s_total_clientbound_dropped_bytes,
+              ((double) s_total_clientbound_dropped_bytes / (double) s_total_clientbound_bytes) * 100);
+    }
+
+    if (s_chance_to_drop_serverbound > 0.0 && s_total_serverbound_packets != 0)
+    {
+        outln("Total Serverbound Dropped Packets: {} ({:.2}% of total packets)", s_total_serverbound_dropped_packets,
+              ((double) s_total_serverbound_dropped_packets / (double) s_total_serverbound_packets) * 100);
+        outln("Total Serverbound Dropped Bytes: {} ({:.2}% of total bytes)", s_total_serverbound_dropped_bytes,
+              ((double) s_total_serverbound_dropped_bytes / (double) s_total_serverbound_bytes) * 100);
+    }
+
+    if (s_chance_to_modify_clientbound > 0.0 && s_total_clientbound_packets != 0)
+    {
+        outln("Total Clientbound Modified Packets: {} ({:.2}% of total packets)", s_total_clientbound_modified_packets,
+              ((double) s_total_clientbound_modified_packets / (double) s_total_clientbound_packets) * 100);
+    }
+
+    if (s_chance_to_modify_serverbound > 0.0 && s_total_serverbound_packets != 0)
+    {
+        outln("Total Serverbound Modified Packets: {} ({:.2}% of total packets)", s_total_serverbound_modified_packets,
+              ((double) s_total_serverbound_modified_packets / (double) s_total_serverbound_packets) * 100);
+    }
+
+    exit(0);
+}
+
 int main(int argc, char** argv)
 {
+    struct sigaction sa = {};
+    sa.sa_handler = on_sigint;
+    sigaction(SIGINT, &sa, nullptr);
+
     srand(time(nullptr));
     Core::ArgsParser args_parser;
 
     static int the_server_port;
     static int our_server_port;
+    static String the_server_address_string;
+    static IPv4Address the_server_address;
 
-    args_parser.add_option(the_server_port, "The server port that clients get forwarded to.", "the-port", 'P',
-                           "Port");
-    args_parser.add_option(our_server_port, "The server port that clients connect to get to us.", "our-port", 'p',
-                           "Port");
     args_parser.add_option(s_fake_serverbound_latency,
                            "Introduce a constant fake serverbound latency to packets, in milliseconds",
                            "server-latency", 'l', "Latency");
@@ -102,8 +166,22 @@ int main(int argc, char** argv)
     args_parser.add_option(s_small_modification,
                            "Only increment or decrement that single byte",
                            "small", 's');
+    args_parser.add_positional_argument(the_server_address_string, "Address of the server to forward", "The address");
+    args_parser.add_positional_argument(the_server_port, "Port of the server to forward", "The port");
+    args_parser.add_positional_argument(our_server_port,
+                                        "Port of the server to bind to, that will forward packets to The address",
+                                        "The port");
     if (!args_parser.parse(argc, argv))
         return 1;
+
+    auto maybe_the_server_address = IPv4Address::from_string(the_server_address_string);
+    if (!maybe_the_server_address.has_value())
+    {
+        warnln("Invalid address.");
+        return 2;
+    }
+
+    the_server_address = maybe_the_server_address.release_value();
 
     Core::EventLoop event_loop;
 
@@ -120,13 +198,18 @@ int main(int argc, char** argv)
         }
 
         auto bytes = the_server->receive(max_data_length);
+        s_total_clientbound_packets++;
+        s_total_clientbound_bytes += bytes.size();
         if (s_chance_to_drop_clientbound > (double) (rand() / (double) RAND_MAX))
         {
             dbgln_if(DROP_PACKET_DEBUG, "Dropping clientbound packet");
+            s_total_clientbound_dropped_packets++;
+            s_total_clientbound_dropped_bytes += bytes.size();
             return;
         }
         if (s_chance_to_modify_clientbound > (double) (rand() / (double) RAND_MAX))
         {
+            s_total_clientbound_modified_packets++;
             auto random_index = AK::get_random_uniform(bytes.size());
             if (s_small_modification)
                 bytes[random_index]--;
@@ -145,15 +228,22 @@ int main(int argc, char** argv)
         if (!who.has_value())
         {
             who = last_who;
-            outln("Someone has connected, using them ");
+            outln("Someone has connected, using them");
         }
+
+        s_total_serverbound_packets++;
+        s_total_serverbound_bytes += bytes.size();
+
         if (s_chance_to_drop_serverbound > (double) (rand() / (double) RAND_MAX))
         {
             dbgln_if(DROP_PACKET_DEBUG, "Dropping serverbound packet");
+            s_total_serverbound_dropped_packets++;
+            s_total_serverbound_dropped_bytes += bytes.size();
             return;
         }
         if (s_chance_to_modify_serverbound > (double) (rand() / (double) RAND_MAX))
         {
+            s_total_serverbound_modified_packets++;
             auto random_index = AK::get_random_uniform(bytes.size());
             if (s_small_modification)
                 bytes[random_index]--;
@@ -171,7 +261,7 @@ int main(int argc, char** argv)
     };
 
     our_server->bind({}, our_server_port);
-    the_server->connect(Core::SocketAddress({10, 0, 0, 20}), the_server_port);
+    the_server->connect(the_server_address, the_server_port);
 
     return event_loop.exec();
 }
